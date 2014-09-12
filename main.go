@@ -9,9 +9,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha1"
 	"crypto/x509"
-	"encoding/base32"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -19,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"runtime"
 	"sync"
 )
 
@@ -27,16 +26,10 @@ type Result struct {
 	PrivateKey bytes.Buffer
 }
 
-const (
-	onionencoding = "abcdefghijklmnopqrstuvwxyz234567"
-)
-
 var (
-	pattern = flag.String("pattern", "", "onion address pattern")
-
+	pattern      = flag.String("pattern", "", "onion address pattern")
 	onionpattern *regexp.Regexp
-
-	wg sync.WaitGroup
+	wg           sync.WaitGroup
 )
 
 func gen(stop chan bool, out chan Result) {
@@ -54,83 +47,86 @@ generate:
 				break generate
 			}
 
-			derbytes, err := x509.MarshalPKIXPublicKey(&rsakey.PublicKey)
-			if err != nil {
-				log.Printf("x509.MarshalPKIXPublicKey: %s", err)
+			onionaddr := address(&rsakey.PublicKey)
+			if onionaddr == "" {
+				log.Printf("address empty")
 				break generate
 			}
 
-			hash := sha1.New()
-			hash.Write(derbytes)
-			sum := hash.Sum(nil)
-			sum = sum[:10]
-
-			var buf32 bytes.Buffer
-
-			b32enc := base32.NewEncoder(base32.NewEncoding(onionencoding), &buf32)
-			b32enc.Write(sum)
-			b32enc.Close()
-
-			// only need 16 chars
-			buf32.Truncate(16)
-			onion := buf32.String()
-
-			if onionpattern.MatchString(onion) {
-				var res Result
-
-				res.Addr = onion + ".onion"
-
+			if onionpattern.MatchString(onionaddr) {
+				res := Result{Addr: onionaddr + ".onion"}
 				pem.Encode(&res.PrivateKey, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rsakey)})
-
 				out <- res
-
 				break generate
 			}
 
-			//time.Sleep(100 * time.Millisecond)
-			//break generate
+			out <- Result{}
 		}
 	}
-
-	close(out)
 }
 
 func main() {
+	var err error
+
 	flag.Parse()
 
 	if *pattern == "" {
 		log.Fatal("no pattern set")
 	}
 
+	rpat := "^(?i)" + *pattern
+
 	// make sure case insensitive.
-	onionpattern = regexp.MustCompile("(?i)" + *pattern)
+	onionpattern, err = regexp.Compile(rpat)
+
+	if err != nil {
+		log.Fatalf("bad pattern: %s", err)
+	}
+
+	ncpu := runtime.NumCPU()
+
+	log.Printf("searching for %q using %d cpus...", rpat, ncpu)
 
 	sigch := make(chan os.Signal, 1)
+	stop := make(chan bool, 1)
+	out := make(chan Result, ncpu*10)
 
+	runtime.GOMAXPROCS(ncpu)
 	signal.Notify(sigch, os.Interrupt, os.Kill)
 
-	stop := make(chan bool, 1)
-	out := make(chan Result, 1)
+	for i := 0; i < runtime.NumCPU(); i++ {
+		wg.Add(1)
+		go gen(stop, out)
+	}
 
-	go gen(stop, out)
-	wg.Add(1)
+	var stat uint64
 
 	for {
 		select {
 		case s := <-sigch:
-			log.Print("got signal", s)
-			stop <- true
+			log.Printf("got signal %s", s)
+			close(stop)
 			goto done
 		case res := <-out:
-			if res.Addr == "" {
-				goto done
+			stat++
+			if stat%25 == 0 {
+				log.Printf("%d checked...", stat)
 			}
 
-			log.Printf("found match: %s", res.Addr)
+			if res.Addr == "" {
+				break
+			}
+
+			log.Printf("found match after %d tries: %s", stat, res.Addr)
 			fmt.Printf("%s", res.PrivateKey.String())
+
+			close(stop)
+			goto done
 		}
 	}
 
 done:
 	wg.Wait()
+
+	close(out)
 }
